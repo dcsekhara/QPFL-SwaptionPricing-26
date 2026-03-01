@@ -18,9 +18,7 @@ from qpfl.visualization import (
 )
 
 
-def main():
-    full_df = read_data("DATASETS/train.xlsx", output="long", value_name="price")
-
+def visualize_data(full_df: pd.DataFrame):
     fig, sampled_dates = plot_tenor_maturity_lines(
         full_df, n_days=15, seed=7, max_tenors=10
     )
@@ -36,6 +34,13 @@ def main():
     fig = plot_price_vs_date_tenor_maturity_lines(full_df)
     fig.show()
 
+
+
+def main():
+    full_df = read_data("DATASETS/train.xlsx", output="long", value_name="price")
+
+    visualize_data(full_df)
+
     # Local-safe default configs (should run in this environment).
     model_configs = [
         {"name": "linear"},
@@ -45,7 +50,7 @@ def main():
         {"name": "ridge", "alpha": 1.0},
         {"name": "ridge", "alpha": 10.0},
         {"name": "ridge", "alpha": 100.0},
-        {"name": "mlp", "hidden_layer_sizes": (256, 128), "max_iter": 300, "random_state": 42},
+        # {"name": "mlp", "hidden_layer_sizes": (256, 128), "max_iter": 300, "random_state": 42},
     ]
 
     # Optional model configs for environments like Colab (enable as needed):
@@ -58,8 +63,9 @@ def main():
 
     results = run_surface_experiment(
         long_df=full_df,
-        lookback_k=5,
-        cv_method="expanding",
+        lookback_grid=[3, 5, 7, 10],
+        pca_grid=[None, 5, 8, 10, 16, 20, 30, 40],
+        cv_method="walk_forward",
         holdout_size=20,
         n_splits=5,
         train_frac=0.7,
@@ -70,6 +76,7 @@ def main():
     print(results["best_summary"])
     results["fig_rmse"].show()
     results["fig_mae"].show()
+    results["fig_qlike"].show()
 
 
 if __name__ == "__main__":
