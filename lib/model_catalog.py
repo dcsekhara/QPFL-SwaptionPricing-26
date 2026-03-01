@@ -112,7 +112,9 @@ def _build_xgboost_model_specs_from_grid(
 
 
 def baseline_model_specs(ridge_alphas: List[float]) -> List[ModelSpec]:
-    specs: List[ModelSpec] = [ModelSpec(name="linear", model=LinearRegressionModel())]
+    specs: List[ModelSpec] = [
+        # ModelSpec(name="linear", model=LinearRegressionModel())
+    ]
     for alpha in ridge_alphas:
         specs.append(
             ModelSpec(
