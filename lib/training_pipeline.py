@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 from copy import deepcopy
 
 import numpy as np
@@ -199,6 +199,18 @@ class TrainingDriver:
         )
         self.metrics = metrics if metrics is not None else deepcopy(DEFAULT_METRICS)
 
+    def _build_dataset(self) -> SupervisedDataset:
+        if self.dataset_factory is not None:
+            return self.dataset_factory(
+                self.dataset_builder,
+                self.lookback_window,
+                self.include_static_features,
+            )
+        return self.dataset_builder.create_supervised_dataset(
+            lookback_window=self.lookback_window,
+            include_static_features=self.include_static_features,
+        )
+
     def _predict(self, model: ModelInterface, X: np.ndarray) -> np.ndarray:
         if model.supports_batch_prediction:
             try:
@@ -304,18 +316,101 @@ class TrainingDriver:
 
         return np.concatenate(y_true_days), np.concatenate(y_pred_days)
 
-    def run(self, model: ModelInterface) -> PipelineResult:
-        if self.dataset_factory is not None:
-            dataset = self.dataset_factory(
-                self.dataset_builder,
-                self.lookback_window,
-                self.include_static_features,
-            )
+    def _infer_future_dates(self, horizon: int) -> np.ndarray:
+        if horizon <= 0:
+            raise ValueError("horizon must be > 0")
+
+        dates = self.dataset_builder.surface.dates
+        if dates.size == 0:
+            raise ValueError("Surface has no dates.")
+
+        if dates.size == 1:
+            step = np.timedelta64(1, "D")
         else:
-            dataset = self.dataset_builder.create_supervised_dataset(
-                lookback_window=self.lookback_window,
-                include_static_features=self.include_static_features,
-            )
+            diffs = np.diff(dates).astype("timedelta64[ns]")
+            positive_diffs = diffs[diffs > np.timedelta64(0, "ns")]
+            if positive_diffs.size == 0:
+                step = np.timedelta64(1, "D")
+            else:
+                step_ns = int(np.median(positive_diffs.astype("timedelta64[ns]").astype(np.int64)))
+                if step_ns <= 0:
+                    step_ns = int(np.timedelta64(1, "D").astype("timedelta64[ns]").astype(np.int64))
+                step = np.timedelta64(step_ns, "ns")
+
+        last_date = dates[-1]
+        return np.asarray([last_date + (i + 1) * step for i in range(horizon)], dtype="datetime64[ns]")
+
+    def forecast_after_last_date(
+        self,
+        model: ModelInterface,
+        horizon: int = 6,
+    ) -> Tuple[np.ndarray, pd.DataFrame]:
+        """
+        Fit model on all available supervised samples, then recursively forecast
+        the next `horizon` dates beyond the last observed date.
+        Returns:
+        - prediction matrix with shape [horizon, num_points]
+        - long-form DataFrame with date/tenor/maturity/prediction
+        """
+        if horizon <= 0:
+            raise ValueError("horizon must be > 0")
+
+        dataset = self._build_dataset()
+        final_feature_extractor = self.feature_extractor.clone()
+        final_model = model.clone()
+
+        X_full_raw = dataset.X
+        y_full = dataset.y
+        X_full = final_feature_extractor.fit_transform(X_full_raw, y=y_full)
+        final_model.fit(X_full, y_full)
+
+        n_points = self.dataset_builder.surface.num_points
+        known_values = self.dataset_builder.surface.values
+        rolling_values = np.concatenate(
+            [known_values, np.zeros((horizon, n_points), dtype=known_values.dtype)],
+            axis=0,
+        )
+
+        future_pred_days: List[np.ndarray] = []
+        start_day_idx = int(known_values.shape[0])
+
+        for step in range(horizon):
+            day_idx = start_day_idx + step
+            X_day_raw = self._build_day_feature_matrix(rolling_values, day_idx)
+            X_day = final_feature_extractor.transform(X_day_raw)
+            y_day_pred = self._predict(final_model, X_day).reshape(-1)
+            if y_day_pred.shape[0] != n_points:
+                raise ValueError(
+                    f"Prediction size mismatch on future step {step}: "
+                    f"pred={y_day_pred.shape[0]}, expected={n_points}"
+                )
+            rolling_values[day_idx, :] = y_day_pred
+            future_pred_days.append(y_day_pred)
+
+        future_pred_matrix = np.vstack(future_pred_days)
+        future_dates = self._infer_future_dates(horizon)
+
+        rows = []
+        tenors = self.dataset_builder.surface.tenors
+        maturities = self.dataset_builder.surface.maturities
+        for step_idx in range(horizon):
+            for col_idx in range(n_points):
+                rows.append(
+                    {
+                        "forecast_step": int(step_idx + 1),
+                        "forecast_date": future_dates[step_idx],
+                        "col_idx": int(col_idx),
+                        "tenor": int(tenors[col_idx]),
+                        "maturity": int(maturities[col_idx]),
+                        "prediction": float(future_pred_matrix[step_idx, col_idx]),
+                    }
+                )
+
+        forecast_df = pd.DataFrame(rows)
+        return future_pred_matrix, forecast_df
+
+    def run(self, model: ModelInterface) -> PipelineResult:
+        dataset = self._build_dataset()
 
         cv_splits = list(
             self.dataset_builder.iter_walk_forward_splits(
